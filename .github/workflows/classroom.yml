@@ -19,18 +19,22 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Set up Ruby
-        uses: ruby/setup-ruby@v1
+        id: setup-ruby
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b
         with:
           ruby-version: "3.3.8"
           bundler-cache: false
 
       - name: Install system dependencies
+        id: system-dependencies
         run: sudo apt-get update && sudo apt-get install -y libxml2-dev libxslt1-dev
 
       - name: Decrypt autograder
+        id: decrypt-autograder
         env:
           AUTOGRADER_KEY: ${{ secrets.AUTOGRADER_KEY }}
         run: |
@@ -42,20 +46,29 @@ jobs:
           rm -f /tmp/autograder.tgz
 
       - name: Install app gems
+        id: install-app
         run: bundle install --jobs 4 --retry 3
 
       - name: Install autograder gems
+        id: install-autograder
         run: BUNDLE_GEMFILE=autograder/Gemfile bundle install --jobs 4 --retry 3
 
       - name: Prepare database
-        run: RAILS_ENV=test bin/rails db:create db:migrate db:seed --trace
+        id: prepare-database
+        env:
+          RAILS_ENV: test
+        run: bin/rails db:create db:migrate db:seed --trace
 
       - name: Start Rails server
-        run: RAILS_ENV=test bin/rails server -d -p 3000
+        id: start-server
+        env:
+          RAILS_ENV: test
+        run: bin/rails server -d -p 3000
 
       - name: Wait for server
+        id: wait-server
         run: |
-          for i in {1..30}; do
+          for _ in {1..30}; do
             if curl -sSf http://localhost:3000 >/dev/null; then
               exit 0
             fi
@@ -65,6 +78,7 @@ jobs:
           exit 1
 
       - name: Run autograder
+        id: run-autograder
         continue-on-error: true
         run: |
           mkdir -p autograder/results
@@ -144,7 +158,7 @@ jobs:
           PY
 
       - name: Autograding Reporter
-        uses: classroom-resources/autograding-grading-reporter@v1
+        uses: classroom-resources/autograding-grading-reporter@d13b5912daf5042ac1b71bc38bdb4a6bcd61d8ca
         if: always()
         env:
           APP-RESPONDS_RESULTS: ${{ steps.prepare-results.outputs.app_responds }}
@@ -164,9 +178,101 @@ jobs:
         with:
           runners: app-responds,ratings-form,ratings-submit,ratings-checkboxes,ratings-defaults,filter-by-rating,persist-ratings-submit,sort-title,sort-release,persist-filters-sorting,remember-sort,restful-route,restore-ratings,restore-sort
 
-      - name: Upload results
-        uses: actions/upload-artifact@v4
+      - name: Generate grade result
+        if: always()
+        env:
+          HEAD_SHA: ${{ github.sha }}
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          SETUP_RUBY_OUTCOME: ${{ steps.setup-ruby.outcome }}
+          SYSTEM_DEPENDENCIES_OUTCOME: ${{ steps.system-dependencies.outcome }}
+          DECRYPT_OUTCOME: ${{ steps.decrypt-autograder.outcome }}
+          INSTALL_APP_OUTCOME: ${{ steps.install-app.outcome }}
+          INSTALL_AUTOGRADER_OUTCOME: ${{ steps.install-autograder.outcome }}
+          PREPARE_DATABASE_OUTCOME: ${{ steps.prepare-database.outcome }}
+          START_SERVER_OUTCOME: ${{ steps.start-server.outcome }}
+          WAIT_SERVER_OUTCOME: ${{ steps.wait-server.outcome }}
+          RUN_AUTOGRADER_OUTCOME: ${{ steps.run-autograder.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          expected = [
+              ("App: responds to request", "App responds to a simple request [10 points]", 10),
+              ("Ratings Form: has form", "Ratings Form has #ratings_form form [5 points]", 5),
+              ("Ratings Form: has submit", "Ratings Form has #ratings_submit button [5 points]", 5),
+              ("Ratings Form: has checkboxes", "Ratings Form has rating checkboxes [5 points]", 5),
+              ("Ratings Form: defaults", "Ratings Form checkboxes are uniformly checked or unchecked by default [10 points]", 10),
+              ("Filtering: by rating", "Movie Filtering filters movies by selected rating [20 points]", 20),
+              ("Filtering: persist after submit", "Movie Filtering persists checked ratings after submission [25 points]", 25),
+              ("Sorting: Title", "Movie Sorting can sort by Title via dropdown [20 points]", 20),
+              ("Sorting: Release date", "Movie Sorting can sort by Release Date via dropdown [20 points]", 20),
+              ("Sorting: persist filters", "Movie Sorting persists rating filters when sorting [25 points]", 25),
+              ("Sorting: remember after reload", "Movie Sorting remembers sort order after reload [20 points]", 20),
+              ("RESTful: route", "RESTful Behavior redirects to RESTful route on filter/sort [10 points]", 10),
+              ("RESTful: restore ratings", "RESTful Behavior restores rating filters after reload [20 points]", 20),
+              ("RESTful: restore sort", "RESTful Behavior restores sort order after reload [15 points]", 15),
+          ]
+          results_path = "autograder/results/results.json"
+          source_tests = []
+          errors = []
+          infrastructure = {
+              "checkout": os.environ.get("CHECKOUT_OUTCOME"),
+              "setup-ruby": os.environ.get("SETUP_RUBY_OUTCOME"),
+              "system-dependencies": os.environ.get("SYSTEM_DEPENDENCIES_OUTCOME"),
+              "decrypt-autograder": os.environ.get("DECRYPT_OUTCOME"),
+              "install-app": os.environ.get("INSTALL_APP_OUTCOME"),
+              "install-autograder": os.environ.get("INSTALL_AUTOGRADER_OUTCOME"),
+              "prepare-database": os.environ.get("PREPARE_DATABASE_OUTCOME"),
+              "start-server": os.environ.get("START_SERVER_OUTCOME"),
+              "wait-server": os.environ.get("WAIT_SERVER_OUTCOME"),
+              "run-autograder": os.environ.get("RUN_AUTOGRADER_OUTCOME"),
+          }
+          errors.extend(f"{name}={outcome or 'not_run'}" for name, outcome in infrastructure.items()
+                        if outcome != "success")
+          if os.path.exists(results_path):
+              try:
+                  with open(results_path, encoding="utf-8") as source:
+                      source_tests = json.load(source).get("tests", [])
+              except Exception as exc:
+                  errors.append(f"invalid results.json: {exc}")
+          else:
+              errors.append("missing results.json")
+
+          by_name = {test.get("name"): test for test in source_tests}
+          tests = []
+          for display_name, source_name, maximum in expected:
+              source = by_name.get(source_name)
+              score = source.get("score", 0) if source else 0
+              tests.append({
+                  "name": display_name,
+                  "score": score,
+                  "max_score": maximum,
+                  "status": "passed" if score == maximum else "failed",
+                  "message": (source.get("output", "") or "") if source else "Missing test result",
+              })
+
+          result = {
+              "schema": "cuhk-csci3100-grade/v1",
+              "assignment": "hw03",
+              "head_sha": os.environ["HEAD_SHA"],
+              "score": sum(test["score"] for test in tests),
+              "max_score": 210,
+              "tests": tests,
+          }
+          if errors:
+              result["status"] = "grading_error"
+              result["message"] = "; ".join(errors)
+          with open("grade-result.json", "w", encoding="utf-8") as output:
+              json.dump(result, output, ensure_ascii=False, indent=2, allow_nan=False)
+              output.write("\n")
+          PY
+
+      - name: Upload grade result
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: autograder-results
-          path: autograder/results/results.json
+          name: csci3100-grade-result
+          path: grade-result.json
+          if-no-files-found: error
+          retention-days: 30
